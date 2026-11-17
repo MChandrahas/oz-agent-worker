@@ -14,6 +14,7 @@ import (
 	"github.com/distribution/reference"
 	"github.com/warpdotdev/oz-agent-worker/internal/common"
 	"github.com/warpdotdev/oz-agent-worker/internal/config"
+	"github.com/warpdotdev/oz-agent-worker/internal/health"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	"github.com/warpdotdev/oz-agent-worker/internal/worker"
@@ -45,6 +46,7 @@ var CLI struct {
 	CollectTaskLogs         *bool    `help:"Collect per-task logs requested by the server (default: true)" env:"OZ_COLLECT_TASK_LOGS"`
 	IdleOnComplete          string   `help:"How long to keep the oz agent alive after a task completes, for follow-ups (e.g. 45m, 10m, 0s). Defaults to 45m when not set."`
 	SessionSharingServerURL string   `help:"Session sharing server WebSocket URL to pass through to the oz CLI (e.g. ws://127.0.0.1:8081)" hidden:""`
+	HealthAddr              string   `help:"Address for an HTTP health server exposing /livez and /readyz (e.g. :8080). Disabled when empty." env:"OZ_HEALTH_ADDR"`
 }
 
 func main() {
@@ -90,6 +92,20 @@ func main() {
 	metrics.SetWorkerInfo(Version, workerConfig.BackendType, workerConfig.WorkerID)
 	workerConfig.Tracing = tracingHandle
 
+	// The health server is opt-in. Start it before constructing the worker so
+	// probes get an answer during backend startup, and fail fast on a bad
+	// address: an operator who configured probes would otherwise only see
+	// them failing.
+	var healthServer *health.Server
+	if CLI.HealthAddr != "" {
+		workerConfig.Health = health.NewState(worker.LivenessStaleAfter)
+		healthServer, err = health.Serve(CLI.HealthAddr, workerConfig.Health)
+		if err != nil {
+			log.Fatalf(ctx, "Failed to start health server: %v", err)
+		}
+		log.Infof(ctx, "Health server listening on %s", healthServer.Addr())
+	}
+
 	w, err := worker.New(ctx, workerConfig)
 	if err != nil {
 		log.Fatalf(ctx, "Failed to create worker: %v", err)
@@ -97,6 +113,14 @@ func main() {
 
 	if err := w.Run(); err != nil {
 		log.Errorf(ctx, "Worker stopped with error: %v", err)
+	}
+
+	if healthServer != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := healthServer.Shutdown(shutdownCtx); err != nil {
+			log.Warnf(ctx, "Failed to shut down health server cleanly: %v", err)
+		}
+		cancel()
 	}
 
 	// Flush and stop the metrics exporter after the worker has stopped

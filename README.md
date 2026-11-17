@@ -380,7 +380,14 @@ The chart always deploys a single replica for a given `worker.workerId`. If you 
 
 The chart defaults the long-lived worker `Deployment` to a non-root security context and conservative starting resource requests of `100m` CPU and `128Mi` memory. Tune `worker.resources` for your workload and cluster policy.
 
-The Deployment includes a default `exec` liveness probe that checks the worker process is still running (`kill -0 1`). If the worker becomes unresponsive, Kubernetes will restart the pod after three consecutive failures. Override `worker.livenessProbe` in your values to use a custom probe (e.g. `httpGet` if you add a health endpoint), or set it to `null` to disable.
+The Deployment includes a default `exec` liveness probe that checks the worker process is still running (`kill -0 1`). If the worker becomes unresponsive, Kubernetes will restart the pod after three consecutive failures. Override `worker.livenessProbe` in your values to use a custom probe, or set it to `null` to disable.
+
+The `exec` probe only detects a dead process. To also detect a worker that is running but stuck, set `health.enabled=true`. The worker then serves two HTTP endpoints on `health.port` (default `8080`) and the chart switches the liveness probe to `/livez`:
+
+- `/livez` returns `200` while the worker's connection loop is making progress and `503` once it has stalled for 3 minutes. It does not depend on the connection to Oz: a worker that is retrying a lost connection stays live, so an Oz outage never restarts your workers.
+- `/readyz` returns `200` only while the worker is connected to Oz. The chart does not use it by default; set `health.readinessProbe` to add a readiness probe. Because the worker dials out and receives no inbound task traffic, readiness affects rollout progress and pod status only. A not-ready pod is also dropped from the metrics `Service` endpoints, so prefer the `PodMonitor` if you scrape metrics and enable readiness.
+
+Outside Kubernetes, enable the endpoints with `--health-addr :8080` (or `OZ_HEALTH_ADDR`). The health server is off when the address is empty.
 
 When the long-lived worker pod is terminated by normal Kubernetes disruption
 (for example Karpenter node consolidation), the Kubernetes backend preserves
