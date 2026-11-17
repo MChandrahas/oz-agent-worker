@@ -12,6 +12,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/warpdotdev/oz-agent-worker/internal/common"
+	"github.com/warpdotdev/oz-agent-worker/internal/health"
 	"github.com/warpdotdev/oz-agent-worker/internal/log"
 	"github.com/warpdotdev/oz-agent-worker/internal/metrics"
 	tasklogs "github.com/warpdotdev/oz-agent-worker/internal/tasktelemetry/log"
@@ -40,6 +41,13 @@ const (
 	executionCancellationCapability = "execution-scoped-cancellation-v1"
 )
 
+// LivenessStaleAfter is how long the connection supervisor may go without
+// reporting progress before the liveness endpoint fails. A healthy worker
+// reports at least every MaxReconnectDelay while backing off, within the
+// dialer's 45s handshake timeout while connecting, and on every pong
+// (HeartbeatInterval) while connected, so this leaves a wide margin.
+const LivenessStaleAfter = 3 * time.Minute
+
 type Config struct {
 	APIKey        string
 	WorkerID      string
@@ -66,6 +74,10 @@ type Config struct {
 	CollectTaskLogs         bool
 	Tracing                 *tracing.Handle
 	SidecarImageMappings    *common.ImageRemapper
+
+	// Health receives liveness and readiness signals for the optional health
+	// server. It may be nil, and all of its methods are safe to call on nil.
+	Health *health.State
 
 	// Backend-specific configs. Only the one matching BackendType should be set.
 	Docker     *DockerBackendConfig
@@ -279,9 +291,14 @@ func (w *Worker) Run() error {
 	defer protocolCancel()
 	defer w.shutdownBackend()
 	w.startStandbyExitWatcher()
+	// Shutdown may block while tasks drain, so tell the health state as soon
+	// as cancellation is requested rather than when the loop observes it.
+	stopShutdownSignal := context.AfterFunc(w.ctx, w.config.Health.SetShuttingDown)
+	defer stopShutdownSignal()
 	reconnectDelay := InitialReconnectDelay
 
 	for {
+		w.config.Health.Progress()
 		if w.ctx.Err() != nil {
 			w.shutdownTasks()
 			w.outbound.Close()
@@ -297,6 +314,8 @@ func (w *Worker) Run() error {
 			}
 			log.Errorf(w.ctx, "Failed to connect: %v, retrying in %v", err, reconnectDelay)
 			metrics.RecordWebsocketReconnect(metrics.WSReconnectReasonDialFailed)
+			// Retrying is progress: liveness must not depend on reaching Oz.
+			w.config.Health.Progress()
 			timer := time.NewTimer(reconnectDelay)
 			select {
 			case <-timer.C:
@@ -319,7 +338,9 @@ func (w *Worker) Run() error {
 
 		reconnectDelay = InitialReconnectDelay
 		metrics.SetConnected(true)
+		w.config.Health.SetConnected(true)
 		outcome := w.serveConnection(protocolCtx, conn)
+		w.config.Health.SetConnected(false)
 		metrics.SetConnected(false)
 		if outcome == runOutcomeOneShotComplete || outcome == runOutcomeServerShutdown {
 			return nil
@@ -357,6 +378,9 @@ func (w *Worker) connect() (*websocket.Conn, error) {
 
 	log.Infof(w.ctx, "Successfully connected to server")
 	conn.SetPongHandler(func(string) error {
+		// Pongs are dispatched from readLoop's ReadMessage call, so each one
+		// shows that the reader is still servicing the connection.
+		w.config.Health.Progress()
 		if err := conn.SetReadDeadline(time.Now().Add(PongWait)); err != nil {
 			log.Warnf(w.ctx, "Failed to set read deadline in pong handler: %v", err)
 		}
@@ -448,6 +472,9 @@ func (w *Worker) readLoop(ctx context.Context, conn *websocket.Conn) error {
 		default:
 		}
 
+		// Report progress each time the reader returns for the next message.
+		// If handleMessage blocks forever, reports stop and liveness fails.
+		w.config.Health.Progress()
 		if err := conn.SetReadDeadline(time.Now().Add(PongWait)); err != nil {
 			return fmt.Errorf("failed to set read deadline: %w", err)
 		}

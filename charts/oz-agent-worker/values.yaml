@@ -59,8 +59,8 @@ worker:
       drop:
         - ALL
   # Liveness probe for the long-lived worker process. The default checks that
-  # PID 1 is still running. Override with an httpGet probe if you add a health
-  # endpoint to the worker.
+  # PID 1 is still running. Set `health.enabled` to probe the worker's HTTP
+  # health endpoints instead; this probe is then ignored.
   livenessProbe:
     exec:
       command: ["/bin/sh", "-c", "kill -0 1"]
@@ -129,6 +129,39 @@ kubernetesBackend:
   #       cpu: 100m
   #       memory: 64Mi
   preflightResources: {}
+
+# Opt-in HTTP health server. When enabled, the worker serves /livez and
+# /readyz on `health.port` and `health.livenessProbe` replaces
+# `worker.livenessProbe`.
+#
+# /livez fails only when the worker's connection loop has stopped making
+# progress (for example a hung reader), so a restart can help. It stays
+# healthy while the worker retries a lost connection: an Oz outage does not
+# restart workers.
+# /readyz succeeds only while the worker is connected to Oz.
+health:
+  enabled: false
+  port: 8080
+  livenessProbe:
+    httpGet:
+      path: /livez
+      port: health
+    initialDelaySeconds: 10
+    periodSeconds: 30
+    failureThreshold: 3
+  # Readiness probe, off by default. The worker dials out and serves no
+  # inbound task traffic, so readiness only affects rollout progress and
+  # what `kubectl get pods` reports. Note that a not-ready pod is removed
+  # from the metrics Service endpoints, which can hide the worker from
+  # Service-based scraping exactly while it is disconnected; PodMonitor
+  # scraping is unaffected. Example:
+  #   readinessProbe:
+  #     httpGet:
+  #       path: /readyz
+  #       port: health
+  #     periodSeconds: 10
+  #     failureThreshold: 3
+  readinessProbe: {}
 
 # Metrics export uses the OpenTelemetry autoexport package, so the operator
 # selects the exporter via standard OpenTelemetry environment variables. When

@@ -55,6 +55,10 @@ spec:
             - {{ .Values.warp.webSocketURL | quote }}
             - --server-root-url
             - {{ .Values.warp.serverRootURL | quote }}
+            {{- if .Values.health.enabled }}
+            - --health-addr
+            - {{ printf ":%v" .Values.health.port | quote }}
+            {{- end }}
             {{- range .Values.worker.extraArgs }}
             - {{ . | quote }}
             {{- end }}
@@ -88,19 +92,38 @@ spec:
             - name: OTEL_METRICS_EXPORTER
               value: "none"
             {{- end }}
-          {{- if and .Values.metrics.enabled (eq .Values.metrics.exporter "prometheus") }}
+          {{- $metricsPort := and .Values.metrics.enabled (eq .Values.metrics.exporter "prometheus") }}
+          {{- if or $metricsPort .Values.health.enabled }}
           ports:
+            {{- if $metricsPort }}
             - name: metrics
               containerPort: {{ .Values.metrics.port }}
               protocol: TCP
+            {{- end }}
+            {{- if .Values.health.enabled }}
+            - name: health
+              containerPort: {{ .Values.health.port }}
+              protocol: TCP
+            {{- end }}
           {{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/oz-agent-worker
               readOnly: true
+          {{- if .Values.health.enabled }}
+          {{- with .Values.health.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.health.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- else }}
           {{- with .Values.worker.livenessProbe }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}
+          {{- end }}
           {{- end }}
           {{- with .Values.worker.securityContext }}
           securityContext:
